@@ -1,5 +1,5 @@
 class Produto:
-    def __init__(self, name: str, code:str, category:str, quantity:int, price:float, description:str,supplier:str ):
+    def __init__(self, name: str, code:str, category:str, quantity:int, price:float, description:str,supplier:str, alert:int ):
         self.name= name
         self.code = code
         self.category = category
@@ -7,6 +7,8 @@ class Produto:
         self.price = price
         self.description = description
         self.supplier = supplier
+        self.alert = alert
+
 
     def update_price(self, price:float):
         self.price = float(price)
@@ -22,6 +24,11 @@ class Produto:
         self.quantity =  qtd
     def add_to_invetory(self, qtd:int):
         self.quantity = self.quantity+ qtd
+    def update_alert(self, qtd):
+        self.alert = qtd
+    def trigger_alert(self):
+        return "Estoque Baixo" if self.quantity < self.alert else None 
+    
 
 
 # prod1 = Produto("xpto", "123","batata", 30, 45.90,"description", "MAGALU")
