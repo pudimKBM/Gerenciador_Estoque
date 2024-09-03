@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
-from typing import Dict
+from typing import Dict, List, Optional
 from passlib.context import CryptContext
 
 app = FastAPI()
@@ -59,8 +59,7 @@ class GerenciadorEstoque:
     def alerta_estoque_baixo(self):
         return {codigo: produto for codigo, produto in self.estoque.items() if produto.quantidade < 5}
 
-
-# Modelo Pydantic para validação de entrada de dados
+# Modelos Pydantic para validação de entrada de dados
 class ProdutoInput(BaseModel):
     nome: str
     codigo: str
@@ -70,65 +69,91 @@ class ProdutoInput(BaseModel):
     descricao: str
     fornecedor: str
 
+# Modelos Pydantic para usuários
 class Usuario(BaseModel):
     username: str
+    full_name: Optional[str] = None
+    email: Optional[str] = None
+    disabled: Optional[bool] = False
+
+class UsuarioCreate(Usuario):
     password: str
-    
+
+class UsuarioInDB(Usuario):
+    hashed_password: str
+
 # Instância do gerenciador de estoque
 gerenciador = GerenciadorEstoque()
 
 # Simulação de banco de dados de usuários
-usuarios_db = {
-    "user1": {
-        "username": "user1",
-        "full_name": "User One",
-        "email": "user1@example.com",
-        "hashed_password": "$2b$12$KixcHxlOe.YmVfXH5tBZjeIjsuSZxThmFfXuzYvhP5gQab7sVXvXO",  # senha: "secret"
-        "disabled": False,
-    }
+usuarios_db: Dict[str, UsuarioInDB] = {
+    "user1": UsuarioInDB(
+        username="user1",
+        full_name="User One",
+        email="user1@example.com",
+        hashed_password="$2b$12$KixcHxlOe.YmVfXH5tBZjeIjsuSZxThmFfXuzYvhP5gQab7sVXvXO",  # senha: "secret"
+        disabled=False,
+    )
 }
 
-# Criptografia de senha
+# Configuração de criptografia de senhas
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# Função para gerar hash da senha
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
 
 # Função para verificar senha
 def verify_password(plain_password, hashed_password):
     return pwd_context.verify(plain_password, hashed_password)
 
 # Função para autenticar usuário
-def authenticate_user(username: str, password: str):
+def authenticate_user(username: str, password: str) -> Optional[UsuarioInDB]:
     user = usuarios_db.get(username)
-    if not user:
-        return False
-    if not verify_password(password, user["hashed_password"]):
-        return False
+    if not user or not verify_password(password, user.hashed_password):
+        return None
     return user
 
-# OAuth2 esquema (simplesmente para utilizar o mecanismo de dependências)
+# Esquema OAuth2 para autenticação
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 @app.post("/token")
-async def login(usuario: Usuario = Depends()):
-    user = authenticate_user(usuario.username, usuario.password)
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    user = authenticate_user(form_data.username, form_data.password)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    # Retornando um token simples
-    return {"access_token": user["username"], "token_type": "bearer"}
+    return {"access_token": user.username, "token_type": "bearer"}
 
 # Dependência para autenticação
-async def get_current_user(token: str = Depends(oauth2_scheme)):
+async def get_current_user(token: str = Depends(oauth2_scheme)) -> UsuarioInDB:
     user = usuarios_db.get(token)
-    if user is None:
+    if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid authentication credentials",
             headers={"WWW-Authenticate": "Bearer"},
         )
     return user
+
+# Endpoint para criar um novo usuário
+@app.post("/usuarios/", response_model=Usuario)
+async def create_user(usuario: UsuarioCreate):
+    if usuario.username in usuarios_db:
+        raise HTTPException(status_code=400, detail="Username already registered")
+    
+    hashed_password = hash_password(usuario.password)
+    user_in_db = UsuarioInDB(**usuario.dict(), hashed_password=hashed_password)
+    usuarios_db[usuario.username] = user_in_db
+    return user_in_db
+
+# Endpoint para listar todos os usuários (apenas para fins de administração)
+@app.get("/usuarios/", response_model=List[Usuario])
+async def list_users(current_user: UsuarioInDB = Depends(get_current_user)):
+    return list(usuarios_db.values())
 
 # Endpoint para cadastrar produtos (apenas para usuários autenticados)
 @app.post("/produtos/")
