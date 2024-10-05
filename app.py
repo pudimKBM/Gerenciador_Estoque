@@ -3,6 +3,8 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from typing import Dict, List, Optional
 from passlib.context import CryptContext
+from datetime import datetime, timezone  # Updated import
+from typing import Dict, List, Optional
 
 app = FastAPI()
 
@@ -20,7 +22,6 @@ class Produto:
     def __str__(self):
         return f"{self.nome} ({self.codigo}) - {self.quantidade} unidades em estoque"
 
-
 class GerenciadorEstoque:
     def __init__(self):
         self.estoque = {}
@@ -35,6 +36,14 @@ class GerenciadorEstoque:
     def adicionar_estoque(self, codigo, quantidade):
         if codigo in self.estoque:
             self.estoque[codigo].quantidade += quantidade
+            movimentacao = Movimentacao(
+                tipo="adicao",
+                codigo_produto=codigo,
+                quantidade=quantidade,
+                data=datetime.now(timezone.utc),  # Updated
+                usuario="Sistema"  # Pode ser ajustado para registrar o usuário
+            )
+            gerenciador_vendas.movimentacoes.append(movimentacao)
             return self.estoque[codigo]
         else:
             raise ValueError("Produto não encontrado")
@@ -82,8 +91,126 @@ class UsuarioCreate(Usuario):
 class UsuarioInDB(Usuario):
     hashed_password: str
 
+# Modelos Pydantic para vendas
+class SaleItem(BaseModel):
+    codigo: str
+    quantidade: int
+    preco_unitario: float
+    desconto: Optional[float] = 0.0  # Em percentual
+
+class VendaInput(BaseModel):
+    items: List[SaleItem]
+    desconto_total: Optional[float] = 0.0  # Desconto aplicado na venda inteira
+
+class Venda(BaseModel):
+    id_venda: int
+    data: datetime
+    itens: List[SaleItem]
+    total: float
+    desconto_total: float
+    usuario: str
+
+class Movimentacao(BaseModel):
+    tipo: str  # 'adicao' ou 'remocao'
+    codigo_produto: str
+    quantidade: int
+    data: datetime
+    usuario: str
+
+# Modelos Pydantic para promoções
+class Promocao(BaseModel):
+    codigo: str
+    descricao: str
+    desconto_percentual: float  # Percentual de desconto
+
 # Instância do gerenciador de estoque
 gerenciador = GerenciadorEstoque()
+
+# Instância do gerenciador de vendas
+class VendaInternal:
+    def __init__(self, id_venda, data, itens, total, desconto_total, usuario):
+        self.id_venda = id_venda
+        self.data = data
+        self.itens = itens
+        self.total = total
+        self.desconto_total = desconto_total
+        self.usuario = usuario
+
+class GerenciadorVendas:
+    def __init__(self):
+        self.vendas: List[VendaInternal] = []
+        self.movimentacoes: List[Movimentacao] = []
+        self.proximo_id = 1
+
+    def registrar_venda(self, venda_input: VendaInput, usuario: str):
+        total = 0.0
+        for item in venda_input.items:
+            produto = gerenciador.estoque.get(item.codigo)
+            if not produto:
+                raise ValueError(f"Produto com código {item.codigo} não encontrado.")
+            if produto.quantidade < item.quantidade:
+                raise ValueError(f"Estoque insuficiente para o produto {produto.nome}.")
+            # Calcula o total com desconto
+            total += item.quantidade * produto.preco * (1 - item.desconto / 100)
+        
+        # Aplica desconto total
+        total *= (1 - venda_input.desconto_total / 100)
+
+        # Atualiza o estoque e registra movimentações
+        for item in venda_input.items:
+            gerenciador.remover_estoque(item.codigo, item.quantidade)
+            movimentacao = Movimentacao(
+                tipo="remocao",
+                codigo_produto=item.codigo,
+                quantidade=item.quantidade,
+                data=datetime.now(timezone.utc),  # Updated
+                usuario=usuario
+            )
+            self.movimentacoes.append(movimentacao)
+        
+        venda = VendaInternal(
+            id_venda=self.proximo_id,
+            data=datetime.now(timezone.utc),  # Updated
+            itens=venda_input.items,
+            total=total,
+            desconto_total=venda_input.desconto_total,
+            usuario=usuario
+        )
+        self.vendas.append(venda)
+        self.proximo_id += 1
+        return venda
+
+    def gerar_recibo(self, id_venda: int) -> Dict:
+        venda = next((v for v in self.vendas if v.id_venda == id_venda), None)
+        if not venda:
+            raise ValueError("Venda não encontrada.")
+        
+        recibo = {
+            "id_venda": venda.id_venda,
+            "data": venda.data,
+            "usuario": venda.usuario,
+            "itens": [
+                {
+                    "codigo": item.codigo,
+                    "quantidade": item.quantidade,
+                    "preco_unitario": item.preco_unitario,
+                    "desconto": item.desconto,
+                    "subtotal": round(item.quantidade * item.preco_unitario * (1 - item.desconto / 100), 2)
+                }
+                for item in venda.itens
+            ],
+            "desconto_total": venda.desconto_total,
+            "total": round(venda.total, 2)
+        }
+        return recibo
+
+    def relatorio_vendas(self):
+        return self.vendas
+
+    def relatorio_movimentacoes(self):
+        return self.movimentacoes
+
+gerenciador_vendas = GerenciadorVendas()
 
 # Simulação de banco de dados de usuários
 usuarios_db: Dict[str, UsuarioInDB] = {
@@ -95,6 +222,9 @@ usuarios_db: Dict[str, UsuarioInDB] = {
         disabled=False,
     )
 }
+
+# Banco de dados de promoções
+promocoes_db: Dict[str, Promocao] = {}
 
 # Configuração de criptografia de senhas
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -146,7 +276,7 @@ async def create_user(usuario: UsuarioCreate):
         raise HTTPException(status_code=400, detail="Username already registered")
     
     hashed_password = hash_password(usuario.password)
-    user_in_db = UsuarioInDB(**usuario.dict(), hashed_password=hashed_password)
+    user_in_db = UsuarioInDB(**usuario.model_dump(), hashed_password=hashed_password)
     usuarios_db[usuario.username] = user_in_db
     return user_in_db
 
@@ -157,7 +287,7 @@ async def list_users(current_user: UsuarioInDB = Depends(get_current_user)):
 
 # Endpoint para cadastrar produtos (apenas para usuários autenticados)
 @app.post("/produtos/")
-async def cadastrar_produto(produto: ProdutoInput, user: dict = Depends(get_current_user)):
+async def cadastrar_produto(produto: ProdutoInput, current_user: UsuarioInDB = Depends(get_current_user)):
     try:
         novo_produto = gerenciador.cadastrar_produto(
             nome=produto.nome,
@@ -168,42 +298,122 @@ async def cadastrar_produto(produto: ProdutoInput, user: dict = Depends(get_curr
             descricao=produto.descricao,
             fornecedor=produto.fornecedor
         )
+        # Registrar movimentação de adição ao estoque
+        movimentacao = Movimentacao(
+            tipo="adicao",
+            codigo_produto=produto.codigo,
+            quantidade=produto.quantidade,
+            data=datetime.now(timezone.utc),  # Updated
+            usuario=current_user.username
+        )
+        gerenciador_vendas.movimentacoes.append(movimentacao)
         return novo_produto
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 # Endpoint para adicionar ao estoque
 @app.put("/produtos/{codigo}/adicionar")
-async def adicionar_estoque(codigo: str, quantidade: int, user: dict = Depends(get_current_user)):
+async def adicionar_estoque(codigo: str, quantidade: int, current_user: UsuarioInDB = Depends(get_current_user)):
     try:
         produto_atualizado = gerenciador.adicionar_estoque(codigo, quantidade)
+        # Registrar movimentação de adição
+        movimentacao = Movimentacao(
+            tipo="adicao",
+            codigo_produto=codigo,
+            quantidade=quantidade,
+            data=datetime.now(timezone.utc),  # Updated
+            usuario=current_user.username
+        )
+        gerenciador_vendas.movimentacoes.append(movimentacao)
         return produto_atualizado
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 # Endpoint para remover do estoque
 @app.put("/produtos/{codigo}/remover")
-async def remover_estoque(codigo: str, quantidade: int, user: dict = Depends(get_current_user)):
+async def remover_estoque(codigo: str, quantidade: int, current_user: UsuarioInDB = Depends(get_current_user)):
     try:
         produto_atualizado = gerenciador.remover_estoque(codigo, quantidade)
+        # Registrar movimentação de remoção
+        movimentacao = Movimentacao(
+            tipo="remocao",
+            codigo_produto=codigo,
+            quantidade=quantidade,
+            data=datetime.now(timezone.utc),  # Updated
+            usuario=current_user.username
+        )
+        gerenciador_vendas.movimentacoes.append(movimentacao)
         return produto_atualizado
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 # Endpoint para atualizar o estoque
 @app.put("/produtos/{codigo}/atualizar")
-async def atualizar_estoque(codigo: str, quantidade: int, user: dict = Depends(get_current_user)):
+async def atualizar_estoque(codigo: str, quantidade: int, current_user: UsuarioInDB = Depends(get_current_user)):
     try:
         produto_atualizado = gerenciador.atualizar_estoque(codigo, quantidade)
+        # Registrar movimentação de atualização
+        movimentacao = Movimentacao(
+            tipo="atualizacao",
+            codigo_produto=codigo,
+            quantidade=quantidade,
+            data=datetime.now(timezone.utc),  # Updated
+            usuario=current_user.username
+        )
+        gerenciador_vendas.movimentacoes.append(movimentacao)
         return produto_atualizado
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 # Endpoint para alerta de estoque baixo
 @app.get("/produtos/alerta")
-async def alerta_estoque_baixo(user: dict = Depends(get_current_user)):
+async def alerta_estoque_baixo(current_user: UsuarioInDB = Depends(get_current_user)):
     alerta = gerenciador.alerta_estoque_baixo()
     return alerta
+
+# Endpoint para registrar uma venda
+@app.post("/vendas/")
+async def registrar_venda(venda: VendaInput, current_user: UsuarioInDB = Depends(get_current_user)):
+    try:
+        # Atualizar preços com base no estoque atual
+        for item in venda.items:
+            produto = gerenciador.estoque.get(item.codigo)
+            if produto:
+                item.preco_unitario = produto.preco
+        nova_venda = gerenciador_vendas.registrar_venda(venda, current_user.username)
+        recibo = gerenciador_vendas.gerar_recibo(nova_venda.id_venda)
+        return recibo
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+# Endpoint para gerar relatório de vendas
+@app.get("/relatorios/vendas/")
+async def relatorio_vendas(current_user: UsuarioInDB = Depends(get_current_user)):
+    vendas = gerenciador_vendas.relatorio_vendas()
+    return vendas
+
+# Endpoint para gerar relatório de estoque
+@app.get("/relatorios/estoque/")
+async def relatorio_estoque(current_user: UsuarioInDB = Depends(get_current_user)):
+    return gerenciador.estoque
+
+# Endpoint para gerar histórico de movimentações
+@app.get("/relatorios/movimentacoes/")
+async def relatorio_movimentacoes(current_user: UsuarioInDB = Depends(get_current_user)):
+    movimentacoes = gerenciador_vendas.relatorio_movimentacoes()
+    return movimentacoes
+
+# Endpoints para gerenciar promoções
+@app.post("/promocoes/")
+async def criar_promocao(promocao: Promocao, current_user: UsuarioInDB = Depends(get_current_user)):
+    if promocao.codigo in promocoes_db:
+        raise HTTPException(status_code=400, detail="Código de promoção já existe.")
+    promocoes_db[promocao.codigo] = promocao
+    return promocao
+
+@app.get("/promocoes/")
+async def listar_promocoes(current_user: UsuarioInDB = Depends(get_current_user)):
+    return list(promocoes_db.values())
 
 if __name__ == "__main__":
     import uvicorn

@@ -1,5 +1,6 @@
 fastapi
 uvicorn
-passlib
-bcrypt
+passlib[bcrypt]
 python-multipart
+pytest
+pytest-cov
